@@ -619,6 +619,32 @@ class test_AsyncSQSConnection(AWSCase):
             },
         )
 
+    def test_change_message_visibility_batch_from_handles(self):
+        queue_url = 'https://sqs.us-west-2.amazonaws.com/1/queue'
+        entries = [
+            {'Id': '0', 'ReceiptHandle': 'r1', 'VisibilityTimeout': 30},
+            {'Id': '1', 'ReceiptHandle': 'r2', 'VisibilityTimeout': 30},
+        ]
+        self.x.change_message_visibility_batch_from_handles(
+            queue_url, entries, callback=self.callback,
+        )
+
+        self.x.get_object.assert_called_once_with(
+            'ChangeMessageVisibilityBatch', {}, queue_url,
+            verb='POST', callback=self.callback,
+            protocol_params={
+                'json': {'Entries': entries},
+                'query': {
+                    'ChangeMessageVisibilityBatchRequestEntry.1.Id': '0',
+                    'ChangeMessageVisibilityBatchRequestEntry.1.ReceiptHandle': 'r1',
+                    'ChangeMessageVisibilityBatchRequestEntry.1.VisibilityTimeout': '30',
+                    'ChangeMessageVisibilityBatchRequestEntry.2.Id': '1',
+                    'ChangeMessageVisibilityBatchRequestEntry.2.ReceiptHandle': 'r2',
+                    'ChangeMessageVisibilityBatchRequestEntry.2.VisibilityTimeout': '30',
+                },
+            },
+        )
+
     def test_get_all_queues(self):
         self.x.get_all_queues(callback=self.callback)
         self.x.get_list.assert_called_with(

@@ -1,0 +1,21 @@
+项目 project-11｜题目 celery-kombu-d6f4f002-44d3-4b66-a2c7-2321345551ee
+Prompt-Rubric 对齐审计：逐条核对冻结 Rubric 与原始中文 Prompt 的场景、目标、失败边界、兼容描述；以下每项引用原 Prompt 已明确的可观察目标。未发现新增接口、文件、错误码、部署或测试夹具门槛。
+P-R 对齐表：
+R1 → Prompt 场景/目标原文“为 SQS transport 提供按消费启用的可见性租约”：启用租约的队列在收到需确认消息后注册 receipt handle，并在可见期届满前安排续期。
+R2 → Prompt 场景/目标原文“为 SQS transport 提供按消费启用的可见性租约”：续期只作用于当前 channel 仍未确认的消息，多个队列和 prefetch 消息各自维护期限。
+R3 → Prompt 场景/目标原文“为 SQS transport 提供按消费启用的可见性租约”：ack、reject、cancel 与 close 会确定地停止后续续期，并与已经发出的请求正确排序。
+R4 → Prompt 场景/目标原文“为 SQS transport 提供按消费启用的可见性租约”：AWS 临时错误按有界退避恢复，连接或凭据刷新后仍关联原 receipt 租约。
+R5 → Prompt 场景/目标原文“为 SQS transport 提供按消费启用的可见性租约”：批量续期逐项处理结果，一条消息失败不会阻止其他成功项更新下一期限。
+R6 → Prompt 场景/目标原文“为 SQS transport 提供按消费启用的可见性租约”：receipt 永久失效或超过最大租约时停止续期，并进入既有重投或恢复语义而非静默延长。
+R7 → Prompt 场景/目标原文“默认关闭时保持当前行为，predefined queue、FIFO 和 no_ack 消费不得被破坏”：功能默认关闭时 SQS 当前行为不变，no_ack 消费不会注册续期。
+R8 → Prompt 场景/目标原文“默认关闭时保持当前行为，predefined queue、FIFO 和 no_ack 消费不得被破坏”：predefined queue、FIFO 消息属性、普通确认删除和 channel 关闭不发生回归。
+验证摘要：uv run --no-sync python -m pytest -q t/unit/transport/SQS/test_SQS.py t/unit/asynchronous/aws/sqs/test_connection.py：233 passed，6.71s。
+逐条比较（按冻结 Rubric 顺序）：
+Rubric ID：1｜状态：通过｜期望行为：启用租约的队列在收到需确认消息后注册 receipt handle，并在可见期届满前安排续期。｜实际观察：uv run --no-sync python -m pytest -q t/unit/transport/SQS/test_SQS.py t/unit/asynchronous/aws/sqs/test_connection.py：233 passed，6.71s。｜直接证据：kombu/transport/SQS/lease.py（本条生产实现）；本题可复现命令输出：uv run --no-sync python -m pytest -q t/unit/transport/SQS/test_SQS.py t/unit/asynchronous/aws/sqs/test_connection.py：233 passed，6.71s。
+Rubric ID：2｜状态：通过｜期望行为：续期只作用于当前 channel 仍未确认的消息，多个队列和 prefetch 消息各自维护期限。｜实际观察：uv run --no-sync python -m pytest -q t/unit/transport/SQS/test_SQS.py t/unit/asynchronous/aws/sqs/test_connection.py：233 passed，6.71s。｜直接证据：kombu/transport/SQS/lease.py（本条生产实现）；本题可复现命令输出：uv run --no-sync python -m pytest -q t/unit/transport/SQS/test_SQS.py t/unit/asynchronous/aws/sqs/test_connection.py：233 passed，6.71s。
+Rubric ID：3｜状态：未通过｜期望行为：ack、reject、cancel 与 close 会确定地停止后续续期，并与已经发出的请求正确排序。｜实际观察：stop_all/stop_queue 取消待运行 timer，但没有等待已经发出的异步请求完成；channel close 返回路径没有 join/await in-flight 请求。｜直接证据：kombu/transport/SQS/lease.py；stop_all、stop_queue、close 调用路径｜原因：stop_all/stop_queue 取消待运行 timer，但没有等待已经发出的异步请求完成；channel close 返回路径没有 join/await in-flight 请求。｜影响：close 返回后此前发出的 ChangeMessageVisibility 请求仍可完成，关闭边界未排序。｜证据位置：kombu/transport/SQS/lease.py；stop_all、stop_queue、close 调用路径
+Rubric ID：4｜状态：未通过｜期望行为：AWS 临时错误按有界退避恢复，连接或凭据刷新后仍关联原 receipt 租约。｜实际观察：定向套件通过 233 项，但没有执行真实 SQS 凭据刷新/连接恢复；当前验证使用 fake async client。｜直接证据：t/unit/asynchronous/aws/sqs/test_connection.py；FakeAsyncSQS 用例｜原因：定向套件通过 233 项，但没有执行真实 SQS 凭据刷新/连接恢复；当前验证使用 fake async client。｜影响：AWS 刷新后继续同一 receipt 租约的行为没有在此验证中覆盖。｜证据位置：t/unit/asynchronous/aws/sqs/test_connection.py；FakeAsyncSQS 用例
+Rubric ID：5｜状态：未通过｜期望行为：批量续期逐项处理结果，一条消息失败不会阻止其他成功项更新下一期限。｜实际观察：定向套件通过 233 项；未发现一个批次响应中一项失败、一项成功并分别重排期限的断言。｜直接证据：t/unit/transport/SQS/test_SQS.py；lease response tests｜原因：定向套件通过 233 项；未发现一个批次响应中一项失败、一项成功并分别重排期限的断言。｜影响：批量部分失败时其他消息继续更新期限的结果未验证。｜证据位置：t/unit/transport/SQS/test_SQS.py；lease response tests
+Rubric ID：6｜状态：通过｜期望行为：receipt 永久失效或超过最大租约时停止续期，并进入既有重投或恢复语义而非静默延长。｜实际观察：uv run --no-sync python -m pytest -q t/unit/transport/SQS/test_SQS.py t/unit/asynchronous/aws/sqs/test_connection.py：233 passed，6.71s。｜直接证据：kombu/transport/SQS/lease.py（本条生产实现）；本题可复现命令输出：uv run --no-sync python -m pytest -q t/unit/transport/SQS/test_SQS.py t/unit/asynchronous/aws/sqs/test_connection.py：233 passed，6.71s。
+Rubric ID：7｜状态：通过｜期望行为：功能默认关闭时 SQS 当前行为不变，no_ack 消费不会注册续期。｜实际观察：uv run --no-sync python -m pytest -q t/unit/transport/SQS/test_SQS.py t/unit/asynchronous/aws/sqs/test_connection.py：233 passed，6.71s。｜直接证据：kombu/transport/SQS/lease.py（本条生产实现）；本题可复现命令输出：uv run --no-sync python -m pytest -q t/unit/transport/SQS/test_SQS.py t/unit/asynchronous/aws/sqs/test_connection.py：233 passed，6.71s。
+Rubric ID：8｜状态：未通过｜期望行为：predefined queue、FIFO 消息属性、普通确认删除和 channel 关闭不发生回归。｜实际观察：已执行 233 项定向测试，但未覆盖 predefined queue、FIFO 属性、普通删除和 close 的组合交错。｜直接证据：t/unit/transport/SQS/test_SQS.py；测试输出 233 passed｜原因：已执行 233 项定向测试，但未覆盖 predefined queue、FIFO 属性、普通删除和 close 的组合交错。｜影响：该兼容组合没有本次运行验证结果。｜证据位置：t/unit/transport/SQS/test_SQS.py；测试输出 233 passed

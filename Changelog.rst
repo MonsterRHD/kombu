@@ -78,6 +78,11 @@ What's Changed
 - Restore pypi long description with a bug fix (#2661)
 - Validate exchange names in the filesystem transport, which interpolated
   them into a path under ``control_folder`` without sanitisation (#2644).
+- SQS: add opt-in per-consumer visibility lease (``visibility_lease``
+  transport option) that batches ChangeMessageVisibility renewals for
+  unacked messages, with bounded backoff, per-queue configuration,
+  deterministic ack/reject/cancel/close ordering and no behavior change
+  when disabled (default).
 - Fix :class:`kombu.utils.limits.TokenBucket` over-admitting on the first
   burst after an idle period. The bucket only advanced its timestamp while
   it was below capacity, so the time it spent sitting full was later counted

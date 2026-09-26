@@ -88,9 +88,81 @@ Message Attributes
 -----------------
 https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-message-metadata.html
 
-SQS supports sending message attributes along with the message body.
+SQS supports sending message attributes along with a message.
 To use this feature, you can pass a 'message_attributes' as keyword argument
 to `basic_publish` method.
+
+Visibility Lease
+----------------
+A received SQS message is hidden from other consumers for the queue's
+visibility timeout.  When a task runs longer than that timeout the
+message becomes visible again while it is still being processed, so
+another worker can receive and execute the same task.
+
+The transport can optionally keep extending the visibility timeout of
+every unacknowledged message it received (a *visibility lease*) until
+the message is acknowledged, rejected, the consumer is cancelled or the
+channel is closed.  It is disabled by default; enable it with the
+``visibility_lease`` transport option:
+
+.. code-block:: python
+
+    app.conf.broker_transport_options = {
+        'visibility_lease': {
+            # Optional settings (defaults shown):
+            'interval': None,       # seconds between renewals; default is
+                                    # visibility_timeout / 2
+            'timeout': None,        # VisibilityTimeout set per renewal;
+                                    # defaults to the channel
+                                    # visibility_timeout (clamped to
+                                    # 1..43200 seconds)
+            'max_duration': None,   # stop renewing after this many seconds
+                                    # and let SQS redeliver (default:
+                                    # keep renewing while processing)
+            'max_retries': 3,       # bounded retries for transient AWS,
+                                    # credential or connection errors
+            'backoff_factor': 2.0,  # exponential backoff base seconds
+            'backoff_max': 30.0,    # backoff cap in seconds
+        },
+    }
+
+``visibility_lease`` may also be set to ``True`` to take all defaults.
+Renewals that fall due are batched per queue with
+``ChangeMessageVisibilityBatch`` (up to 10 entries per request); a
+permanent failure for a single receipt handle (e.g. the handle expired)
+only terminates that message's lease, while transient errors are retried
+with bounded exponential backoff.  The async SQS client is re-resolved
+on every sweep, so refreshed credentials or connections simply continue
+the same lease.
+
+When a receipt handle becomes invalid, retries are exhausted or the
+maximum lease duration is reached, renewal stops and the message falls
+back to SQS's own redelivery and the existing ack/reject recovery
+behavior.
+
+With ``predefined_queues`` the lease can be enabled or tuned per queue
+by adding a ``visibility_lease`` entry (``True``/``False`` or a settings
+dict, merged over the global one):
+
+.. code-block:: python
+
+    transport_options = {
+        'visibility_lease': {'interval': 60, 'timeout': 120},
+        'predefined_queues': {
+            'queue-1': {'url': '...'},  # uses the global settings
+            'queue-2': {
+                'url': '...',
+                'visibility_lease': {'interval': 15},
+            },
+            'queue-3.fifo': {
+                'url': '...',
+                'visibility_lease': False,  # never renew this queue
+            },
+        },
+    }
+
+FIFO queues are supported.  Messages consumed with ``no_ack`` are
+deleted on receipt and never take a lease.
 
 Other Features supported by this transport
 ==========================================
@@ -239,6 +311,7 @@ from kombu.transport.SQS.exceptions import (AccessDeniedQueueException,
                                             DoesNotExistQueueException,
                                             InvalidQueueException,
                                             UndefinedQueueException)
+from kombu.transport.SQS.lease import VisibilityLease
 from kombu.transport.SQS.SNS import SNS as SnsFanout
 from kombu.utils import scheduling
 from kombu.utils.encoding import bytes_to_str, safe_str
@@ -271,14 +344,38 @@ def maybe_int(x):
 class QoS(virtual.QoS):
     """Quality of Service guarantees implementation for SQS."""
 
+    def append(self, message, delivery_tag):
+        super().append(message, delivery_tag)
+        # Start the visibility lease (if enabled) for every message
+        # that requires explicit acknowledgement. no_ack messages are
+        # deleted on receipt and never reach QoS.
+        if self.channel.visibility_lease_enabled:
+            self.channel.visibility_lease.add(message, delivery_tag)
+
+    def ack(self, delivery_tag):
+        if self.channel.visibility_lease_enabled:
+            self.channel.visibility_lease.stop(delivery_tag)
+        super().ack(delivery_tag)
+
     def reject(self, delivery_tag, requeue=False):
-        super().reject(delivery_tag, requeue=requeue)
         routing_key, message, backoff_tasks, backoff_policy = \
             self._extract_backoff_policy_configuration_and_message(
                 delivery_tag)
-        if routing_key and message and backoff_tasks and backoff_policy:
-            self.apply_backoff_policy(
-                routing_key, delivery_tag, backoff_policy, backoff_tasks)
+
+        def _reject_and_maybe_backoff():
+            super(QoS, self).reject(delivery_tag, requeue=requeue)
+            if routing_key and message and backoff_tasks and backoff_policy:
+                self.apply_backoff_policy(
+                    routing_key, delivery_tag, backoff_policy, backoff_tasks)
+
+        if self.channel.visibility_lease_enabled:
+            # The visibility change performed by the backoff policy (or by
+            # the restore on requeue) must not be reordered behind a
+            # renewal request that is still in flight.
+            self.channel.visibility_lease.stop(
+                delivery_tag, then=_reject_and_maybe_backoff)
+        else:
+            _reject_and_maybe_backoff()
 
     def _extract_backoff_policy_configuration_and_message(self, delivery_tag):
         try:
@@ -400,6 +497,9 @@ class Channel(virtual.Channel):
         if consumer_tag in self._consumers:
             queue = self._tag_to_queue[consumer_tag]
             self._noack_queues.discard(queue)
+            lease = self.__dict__.get('visibility_lease')
+            if lease is not None:
+                lease.stop_queue(queue)
         return super().basic_cancel(consumer_tag)
 
     def _queue_bind(self, exchange, routing_key, pattern, queue):
@@ -783,12 +883,30 @@ class Channel(virtual.Channel):
 
     def _restore(self, message,
                  unwanted_delivery_info=('sqs_message', 'sqs_queue')):
+        lease = self.__dict__.get('visibility_lease')
+        if lease is not None:
+            # Order the restore (which changes visibility / reposts the
+            # message) after any renewal request still in flight for this
+            # receipt handle.
+            lease.stop(
+                message.delivery_tag,
+                then=lambda: self._restore_message(
+                    message, unwanted_delivery_info))
+        else:
+            self._restore_message(message, unwanted_delivery_info)
+
+    def _restore_message(self, message, unwanted_delivery_info):
         for unwanted_key in unwanted_delivery_info:
             # Remove objects that aren't JSON serializable (Issue #1108).
             message.delivery_info.pop(unwanted_key, None)
         return super()._restore(message)
 
     def basic_ack(self, delivery_tag, multiple=False):
+        if self.visibility_lease_enabled:
+            # Stop renewal before issuing the delete so no new renewal can
+            # race with the ack; an in-flight renewal of a deleted message
+            # is a harmless no-op.
+            self.visibility_lease.stop(delivery_tag)
         try:
             message = self.qos.get(delivery_tag).delivery_info
             sqs_message = message['sqs_message']
@@ -837,6 +955,12 @@ class Channel(virtual.Channel):
         return size
 
     def close(self):
+        lease = self.__dict__.get('visibility_lease')
+        if lease is not None:
+            # Cancel all renewal timers before consumers are cancelled and
+            # unacked messages are restored; in-flight renewals become
+            # no-ops and settle before any restore proceeds.
+            lease.stop_all()
         super().close()
         # if self._asynsqs:
         #     try:
@@ -1102,6 +1226,25 @@ class Channel(virtual.Channel):
         if timeout is None or timeout == '':
             timeout = self.default_visibility_timeout
         return int(float(timeout))
+
+    @cached_property
+    def visibility_lease_enabled(self):
+        """Whether visibility leases are active for any consumed queue.
+
+        Enabled via the ``visibility_lease`` transport option (``True``
+        or a settings dict) and/or a per-queue ``visibility_lease``
+        setting inside ``predefined_queues``. Disabled by default.
+        """
+        if bool(self.transport_options.get('visibility_lease')):
+            return True
+        return any(
+            bool(q.get('visibility_lease'))
+            for q in self.predefined_queues.values()
+        )
+
+    @cached_property
+    def visibility_lease(self):
+        return VisibilityLease(self)
 
     @cached_property
     def predefined_queues(self):

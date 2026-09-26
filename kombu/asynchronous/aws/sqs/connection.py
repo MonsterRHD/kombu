@@ -293,6 +293,35 @@ class AsyncSQSConnection(AsyncAWSQueryConnection):
             protocol_params=p_params,
         )
 
+    def change_message_visibility_batch_from_handles(self, queue_url, entries,
+                                                     callback=None):
+        """Issue ChangeMessageVisibilityBatch using a queue URL.
+
+        Unlike :meth:`change_message_visibility_batch` this does not
+        require :class:`~kombu.asynchronous.aws.sqs.message.AsyncMessage`
+        objects, so it can renew visibility for messages that were
+        received as raw SQS payloads.
+
+        Arguments:
+        ---------
+            queue_url (str): URL of the queue.
+            entries (list[dict]): Pre-built batch entries, each with
+                ``Id``, ``ReceiptHandle`` and ``VisibilityTimeout``.
+            callback: Called with the parsed batch result, which contains
+                per-entry ``Successful``/``Failed`` lists.
+        """
+        p_params = {
+            'json': {'Entries': entries},
+            'query': _query_object_encode(
+                {'ChangeMessageVisibilityBatchRequestEntry': entries}),
+        }
+
+        return self.get_object(
+            'ChangeMessageVisibilityBatch', {}, queue_url,
+            verb='POST', callback=callback,
+            protocol_params=p_params,
+        )
+
     def get_all_queues(self, prefix='', callback=None):
         params = {}
         if prefix:

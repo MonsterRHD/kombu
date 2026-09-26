@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "启用租约的队列在收到需确认消息后注册 receipt handle，并在可见期届满前安排续期。"
+  - id: 2
+    type: f2p
+    text: "续期只作用于当前 channel 仍未确认的消息，多个队列和 prefetch 消息各自维护期限。"
+  - id: 3
+    type: f2p
+    text: "ack、reject、cancel 与 close 会确定地停止后续续期，并与已经发出的请求正确排序。"
+  - id: 4
+    type: f2p
+    text: "AWS 临时错误按有界退避恢复，连接或凭据刷新后仍关联原 receipt 租约。"
+  - id: 5
+    type: f2p
+    text: "批量续期逐项处理结果，一条消息失败不会阻止其他成功项更新下一期限。"
+  - id: 6
+    type: f2p
+    text: "receipt 永久失效或超过最大租约时停止续期，并进入既有重投或恢复语义而非静默延长。"
+  - id: 7
+    type: p2p
+    text: "功能默认关闭时 SQS 当前行为不变，no_ack 消费不会注册续期。"
+  - id: 8
+    type: f2p
+    text: "predefined queue、FIFO 消息属性、普通确认删除和 channel 关闭不发生回归。"

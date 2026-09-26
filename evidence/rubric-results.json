@@ -1,0 +1,42 @@
+[
+  {
+    "id": 1,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 2,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 3,
+    "passed": false,
+    "reason": "stop_all/stop_queue 取消待运行 timer，但没有等待已经发出的异步请求完成；channel close 返回路径没有 join/await in-flight 请求。"
+  },
+  {
+    "id": 4,
+    "passed": false,
+    "reason": "定向套件通过 233 项，但没有执行真实 SQS 凭据刷新/连接恢复；当前验证使用 fake async client。"
+  },
+  {
+    "id": 5,
+    "passed": false,
+    "reason": "定向套件通过 233 项；未发现一个批次响应中一项失败、一项成功并分别重排期限的断言。"
+  },
+  {
+    "id": 6,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 7,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 8,
+    "passed": false,
+    "reason": "已执行 233 项定向测试，但未覆盖 predefined queue、FIFO 属性、普通删除和 close 的组合交错。"
+  }
+]

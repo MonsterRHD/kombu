@@ -11,11 +11,14 @@ import logging
 import os
 import random
 import string
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from queue import Empty
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import pytest
+from vine import promise
 
 from kombu import Connection, Exchange, Queue, messaging
 from kombu.transport.SQS import UndefinedQueueException, maybe_int
@@ -2397,3 +2400,670 @@ class test_Channel:
                             '0rKwT38xVqr7ZD0u0iPPkUL64lIZbqBAz+scqKmlzm8FDrypNC9Yjc8fPOLn9FX9KSYvKTr4rvx3iSI'
                             'lTJabIQwj2ICCR/oLxBA==',
         }
+
+
+# ---------------------------------------------------------------------------
+# Visibility lease (SQS visibility timeout extension)
+# ---------------------------------------------------------------------------
+
+
+class _FakeTimerEntry:
+    def __init__(self, delay, callback, args):
+        self.delay = delay
+        self._callback = callback
+        self._args = args
+        self.canceled = False
+
+    def cancel(self):
+        self.canceled = True
+
+    def fire(self):
+        if not self.canceled:
+            self._callback(*self._args)
+
+
+class _FakeHub:
+    def __init__(self):
+        self.scheduled = []
+
+    def call_later(self, delay, callback, *args):
+        entry = _FakeTimerEntry(delay, callback, args)
+        self.scheduled.append(entry)
+        return entry
+
+    @property
+    def timers(self):
+        return list(self.scheduled)
+
+
+class _FakeAsyncSQS:
+    def __init__(self):
+        self.requests = []
+
+    def change_message_visibility_batch_from_handles(
+            self, queue_url, entries, callback=None):
+        request = {
+            'url': queue_url, 'entries': list(entries),
+            'callback': callback, 'promise': promise(),
+        }
+        self.requests.append(request)
+        return request['promise']
+
+    def succeed(self, request=None, ids=None, failed=None):
+        request = request or self.requests[-1]
+        request['callback']({
+            'Successful': [{'Id': str(i)} for i in (ids or ())],
+            'Failed': failed or [],
+        })
+
+    def fail(self, request=None, exc=None):
+        request = request or self.requests[-1]
+        request['promise'].throw(exc or RuntimeError('HTTP 503'))
+
+
+class _LeaseChannel:
+    """Minimal channel stand-in driving VisibilityLease."""
+
+    def __init__(self, options=None, predefined_queues=None,
+                 visibility_timeout=100):
+        self.transport_options = options if options is not None else {}
+        self.predefined_queues = predefined_queues or {}
+        self.visibility_timeout = visibility_timeout
+        self.hub = _FakeHub()
+        self.async_connections = defaultdict(_FakeAsyncSQS)
+        self.asynsqs_calls = []
+
+    def canonical_queue_name(self, queue):
+        return queue
+
+    def asynsqs(self, queue=None):
+        self.asynsqs_calls.append(queue)
+        return self.async_connections[queue]
+
+
+def _lease_message(tag, queue='queue-a', queue_url='https://sqs/queue-a'):
+    message = SimpleNamespace()
+    message.delivery_tag = tag
+    message.delivery_info = {
+        'routing_key': queue,
+        'sqs_queue': queue_url,
+        'sqs_message': {'ReceiptHandle': tag},
+    }
+    return message
+
+
+@pytest.mark.usefixtures('monkeypatch_clock')
+class test_VisibilityLease:
+
+    clock = [1000.0]
+
+    @pytest.fixture(autouse=True)
+    def monkeypatch_clock(self, monkeypatch):
+        type(self).clock = [1000.0]
+        monkeypatch.setattr(
+            'kombu.transport.SQS.lease.monotonic',
+            lambda: type(self).clock[0])
+
+    def advance(self, seconds):
+        type(self).clock[0] += seconds
+
+    def lease(self, channel=None, **lease_options):
+        options = {'visibility_lease': {'interval': 10, 'timeout': 20}}
+        options['visibility_lease'].update(lease_options)
+        channel = channel or _LeaseChannel(options)
+        return SQS.VisibilityLease(channel), channel
+
+    def fire_due(self, lease, *tags):
+        for tag in tags:
+            entry = lease._entries[tag]
+            entry.timer.fire()
+
+    # -- configuration ---------------------------------------------------
+
+    def test_disabled_by_default(self):
+        channel = _LeaseChannel({})
+        lease = SQS.VisibilityLease(channel)
+        assert lease.config_for('queue-a') is None
+        lease.add(_lease_message('h1'), 'h1')
+        assert lease.active_count() == 0
+        assert channel.hub.scheduled == []
+
+    def test_enabled_true_uses_visibility_timeout_half_as_interval(self):
+        channel = _LeaseChannel({'visibility_lease': True},
+                                visibility_timeout=40)
+        lease = SQS.VisibilityLease(channel)
+        config = lease.config_for('queue-a')
+        assert config['timeout'] == 40
+        assert config['interval'] == 20.0
+        assert config['max_duration'] is None
+        assert config['max_retries'] == 3
+
+    def test_explicit_options_and_clamping(self):
+        channel = _LeaseChannel({
+            'visibility_lease': {
+                'interval': 5, 'timeout': 999999,
+                'max_duration': 600, 'max_retries': 7,
+                'backoff_factor': 3, 'backoff_max': 9,
+            }})
+        lease = SQS.VisibilityLease(channel)
+        config = lease.config_for('queue-a')
+        assert config['timeout'] == 43200
+        assert config['interval'] == 5.0
+        assert config['max_duration'] == 600.0
+        assert config['max_retries'] == 7
+        assert config['backoff_factor'] == 3.0
+        assert config['backoff_max'] == 9.0
+
+    def test_predefined_queue_setting_merges_and_overrides(self):
+        channel = _LeaseChannel(
+            {'visibility_lease': {'interval': 10, 'timeout': 20}},
+            predefined_queues={
+                'special': {'url': 'u',
+                            'visibility_lease': {'interval': 3}},
+                'off': {'url': 'u2', 'visibility_lease': False},
+            })
+        lease = SQS.VisibilityLease(channel)
+        special = lease.config_for('special')
+        assert special['interval'] == 3.0
+        assert special['timeout'] == 20
+        assert lease.config_for('off') is None
+        assert lease.config_for('other')['timeout'] == 20
+
+    def test_predefined_queue_enables_with_global_disabled(self):
+        channel = _LeaseChannel({}, predefined_queues={
+            'special': {'url': 'u',
+                        'visibility_lease': {'interval': 4, 'timeout': 10}}})
+        lease = SQS.VisibilityLease(channel)
+        assert lease.config_for('special')['interval'] == 4.0
+        assert lease.config_for('plain') is None
+
+    # -- add / scheduling -----------------------------------------------
+
+    def test_add_schedules_first_renewal(self):
+        lease, channel = self.lease()
+        lease.add(_lease_message('h1'), 'h1')
+        entry = lease._entries['h1']
+        assert entry is not None
+        assert entry.timer.delay == 10
+        assert channel.hub.scheduled == [entry.timer]
+
+    def test_add_ignores_messages_without_sqs_metadata(self):
+        lease, channel = self.lease()
+        message = SimpleNamespace()
+        message.delivery_tag = 'h1'
+        message.delivery_info = {'routing_key': 'queue-a'}
+        lease.add(message, 'h1')
+        assert lease.active_count() == 0
+
+    def test_renewal_batches_messages_due_for_same_queue(self):
+        lease, channel = self.lease()
+        lease.add(_lease_message('h1'), 'h1')
+        lease.add(_lease_message('h2'), 'h2')
+        self.advance(10)
+        self.fire_due(lease, 'h1')  # h2 is due within the coalesce grace
+        conn = channel.async_connections['queue-a']
+        assert len(conn.requests) == 1
+        assert [e['ReceiptHandle'] for e in conn.requests[0]['entries']] == \
+            ['h1', 'h2']
+        assert {e['VisibilityTimeout'] for e in conn.requests[0]['entries']} \
+            == {20}
+
+    def test_queues_renew_independently(self):
+        lease, channel = self.lease()
+        lease.add(_lease_message('h1', 'queue-a', 'https://sqs/a'), 'h1')
+        lease.add(_lease_message('h2', 'queue-b', 'https://sqs/b'), 'h2')
+        self.advance(10)
+        # Each queue owns its own timer/request.
+        channel.hub.scheduled[0].fire()
+        channel.hub.scheduled[1].fire()
+        requests_a = channel.async_connections['queue-a'].requests
+        requests_b = channel.async_connections['queue-b'].requests
+        assert [r['url'] for r in requests_a] == ['https://sqs/a']
+        assert [r['url'] for r in requests_b] == ['https://sqs/b']
+        # Failing queue A must not touch the queue B lease: B stays
+        # untouched by A's failure and can still renew successfully.
+        requests_a[0]['promise'].throw(RuntimeError('queue-a down'))
+        assert lease._entries['h1'].retries == 1
+        assert lease._entries['h2'].retries == 0
+        requests_b[0]['callback'](
+            {'Successful': [{'Id': '0'}], 'Failed': []})
+        assert lease._entries['h2'].timer is not None
+
+    def test_batch_is_chunked_at_ten_entries(self):
+        lease, channel = self.lease()
+        for i in range(11):
+            tag = f'h{i}'
+            lease.add(_lease_message(tag), tag)
+        self.advance(10)
+        self.fire_due(lease, 'h0')
+        requests = channel.async_connections['queue-a'].requests
+        assert [len(r['entries']) for r in requests] == [10, 1]
+
+    def test_successful_renewal_reschedules_with_interval_and_resets_retries(
+            self):
+        lease, channel = self.lease()
+        lease.add(_lease_message('h1'), 'h1')
+        self.advance(10)
+        self.fire_due(lease, 'h1')
+        entry = lease._entries['h1']
+        first_timer = entry.timer
+        channel.async_connections['queue-a'].succeed(ids=[0])
+        assert entry.retries == 0
+        assert entry.timer is not first_timer
+        assert entry.timer.delay == 10
+
+    # -- ack / reject / cancel / close ----------------------------------
+
+    def test_ack_cancels_timer(self):
+        lease, channel = self.lease()
+        lease.add(_lease_message('h1'), 'h1')
+        timer = lease._entries['h1'].timer
+        lease.stop('h1')
+        assert timer.canceled is True
+        assert lease.active_count() == 0
+
+    def test_stop_unknown_tag_runs_then_immediately(self):
+        lease, channel = self.lease()
+        done = []
+        lease.stop('never-seen', then=lambda: done.append('ran'))
+        assert done == ['ran']
+
+    def test_stop_while_in_flight_defers_then_until_response_settles(self):
+        lease, channel = self.lease()
+        lease.add(_lease_message('h1'), 'h1')
+        self.advance(10)
+        self.fire_due(lease, 'h1')
+        conn = channel.async_connections['queue-a']
+
+        done = []
+        lease.stop('h1', then=lambda: done.append('reject/backoff'))
+        # The follow-up must not run before the renewal response lands.
+        assert done == []
+        conn.succeed(ids=[0])
+        assert done == ['reject/backoff']
+        assert lease.active_count() == 0
+
+    def test_in_flight_success_after_stop_does_not_reschedule(self):
+        lease, channel = self.lease()
+        lease.add(_lease_message('h1'), 'h1')
+        self.advance(10)
+        self.fire_due(lease, 'h1')
+        scheduled_before = len(channel.hub.scheduled)
+        lease.stop('h1')
+        channel.async_connections['queue-a'].succeed(ids=[0])
+        assert lease.active_count() == 0
+        assert len(channel.hub.scheduled) == scheduled_before
+
+    def test_stop_queue_only_stops_that_queue(self):
+        lease, channel = self.lease()
+        lease.add(_lease_message('h1', 'queue-a', 'https://sqs/a'), 'h1')
+        lease.add(_lease_message('h2', 'queue-b', 'https://sqs/b'), 'h2')
+        timer_a = lease._entries['h1'].timer
+        lease.stop_queue('queue-a')
+        assert timer_a.canceled is True
+        assert 'h1' not in lease._entries
+        assert lease._entries['h2'].timer.canceled is False
+
+    def test_stop_all_cancels_timer_and_ignores_late_responses(self):
+        lease, channel = self.lease()
+        lease.add(_lease_message('h1'), 'h1')
+        lease.add(_lease_message('h2'), 'h2')
+        self.advance(10)
+        self.fire_due(lease, 'h1')  # batches both entries
+        scheduled_before_response = len(channel.hub.scheduled)
+        lease.stop_all()
+        assert lease.closed is True
+        for request in channel.async_connections['queue-a'].requests:
+            request['callback']({
+                'Successful': [{'Id': str(i)}
+                               for i in range(len(request['entries']))],
+                'Failed': [],
+            })
+        # Settled after close: entries gone and no new timers armed.
+        assert lease.active_count() == 0
+        assert len(channel.hub.scheduled) == scheduled_before_response
+        # A delivery arriving after close is not tracked either.
+        lease.add(_lease_message('h3'), 'h3')
+        assert lease.active_count() == 0
+
+    # -- error handling --------------------------------------------------
+
+    def test_transient_request_error_retries_with_bounded_backoff(self):
+        lease, channel = self.lease(max_retries=2, backoff_factor=2,
+                                    backoff_max=30)
+        lease.add(_lease_message('h1'), 'h1')
+        self.advance(10)
+        self.fire_due(lease, 'h1')
+        conn = channel.async_connections['queue-a']
+
+        conn.fail(exc=RuntimeError('HTTP 503'))
+        entry = lease._entries['h1']
+        assert entry.retries == 1
+        assert entry.timer.delay == 2.0  # 2 * 2**0
+
+        self.advance(2)
+        entry.timer.fire()
+        conn.fail(exc=RuntimeError('HTTP 503'))
+        assert entry.retries == 2
+
+        self.advance(4)
+        lease._entries['h1'].timer.fire()
+        conn.fail(exc=RuntimeError('HTTP 503'))
+        assert lease.active_count() == 0  # retries exhausted -> terminated
+
+    def test_successful_renewal_resets_retry_counter(self):
+        lease, channel = self.lease(max_retries=1)
+        lease.add(_lease_message('h1'), 'h1')
+        self.advance(10)
+        self.fire_due(lease, 'h1')
+        conn = channel.async_connections['queue-a']
+        conn.fail(exc=RuntimeError('throttle'))
+        assert lease._entries['h1'].retries == 1
+        self.advance(2)
+        lease._entries['h1'].timer.fire()
+        conn.succeed(ids=[0])
+        assert lease._entries['h1'].retries == 0
+
+    def test_permanent_item_failure_terminates_only_that_item(self):
+        lease, channel = self.lease()
+        lease.add(_lease_message('h1'), 'h1')
+        lease.add(_lease_message('h2'), 'h2')
+        lease.add(_lease_message('h3'), 'h3')
+        self.advance(10)
+        self.fire_due(lease, 'h1')
+        conn = channel.async_connections['queue-a']
+        conn.succeed(
+            ids=[0],
+            failed=[
+                {'Id': '1', 'SenderFault': True,
+                 'Code': 'ReceiptHandleIsInvalid', 'Message': 'gone'},
+                {'Id': '2', 'SenderFault': False,
+                 'Code': 'RequestThrottled', 'Message': 'slow down'},
+            ])
+        assert 'h1' in lease._entries       # renewed
+        assert 'h2' not in lease._entries   # invalid handle -> terminated
+        h3 = lease._entries['h3']
+        assert h3.retries == 1              # throttled -> backoff retry
+        assert h3.timer.delay == 2.0
+
+    def test_credential_or_connection_refresh_continues_same_lease(self):
+        lease, channel = self.lease(max_retries=5)
+        lease.add(_lease_message('h1'), 'h1')
+        self.advance(10)
+        self.fire_due(lease, 'h1')
+        conn = channel.async_connections['queue-a']
+        # Simulate an expired credentials failure; the client is
+        # re-resolved on every sweep.
+        conn.fail(exc=RuntimeError('HTTP 403 AccessDenied'))
+        self.advance(2)
+        lease._entries['h1'].timer.fire()
+        assert channel.asynsqs_calls == ['queue-a', 'queue-a']
+        conn.succeed(ids=[0])
+        assert lease._entries['h1'].retries == 0
+        assert lease.active_count() == 1
+
+    def test_issuing_request_failure_is_retried(self):
+        options = {'visibility_lease': {'interval': 10, 'timeout': 20,
+                                        'max_retries': 1}}
+        channel = _LeaseChannel(options)
+        lease = SQS.VisibilityLease(channel)
+        lease.add(_lease_message('h1'), 'h1')
+
+        def boom(queue=None):
+            raise ConnectionResetError('connection closed')
+
+        channel.asynsqs = boom
+        self.advance(10)
+        lease._entries['h1'].timer.fire()
+        entry = lease._entries['h1']
+        assert entry.retries == 1
+        assert entry.timer is not None
+
+    def test_late_response_for_superseded_entry_does_not_touch_new_lease(
+            self):
+        lease, channel = self.lease()
+        lease.add(_lease_message('h1'), 'h1')
+        self.advance(10)
+        self.fire_due(lease, 'h1')  # first request in flight
+        old_request = channel.async_connections['queue-a'].requests[0]
+
+        # Same delivery tag is tracked again while the old request flies.
+        lease.add(_lease_message('h1'), 'h1')
+        current = lease._entries['h1']
+        new_timer_before = current.timer
+        assert current.in_flight is False
+
+        # The stale in-flight response must neither remove nor reschedule
+        # the current lease.
+        old_request['callback'](
+            {'Successful': [{'Id': '0'}], 'Failed': []})
+        assert lease._entries['h1'] is current
+        assert current.timer is new_timer_before
+        assert len(channel.async_connections['queue-a'].requests) == 1
+
+    # -- maximum lease duration -----------------------------------------
+
+    def test_max_duration_clamps_renewal_timeout_and_terminates(self):
+        lease, channel = self.lease(
+            interval=5, timeout=20, max_duration=12)
+        lease.add(_lease_message('h1'), 'h1')  # started at t=1000
+
+        self.advance(5)  # t=1005, 7s remain -> clamped to 7
+        self.fire_due(lease, 'h1')
+        request = channel.async_connections['queue-a'].requests[0]
+        assert request['entries'][0]['VisibilityTimeout'] == 7
+        request['callback']({'Successful': [{'Id': '0'}], 'Failed': []})
+
+        self.advance(5)  # t=1010, 2s remain
+        lease._entries['h1'].timer.fire()
+        request = channel.async_connections['queue-a'].requests[1]
+        assert request['entries'][0]['VisibilityTimeout'] == 2
+        request['callback']({'Successful': [{'Id': '0'}], 'Failed': []})
+
+        self.advance(2)  # t=1012 -> max lease reached
+        lease._entries['h1'].timer.fire()
+        assert lease.active_count() == 0
+        # No renewal request was issued at/after the deadline.
+        assert len(channel.async_connections['queue-a'].requests) == 2
+
+
+class test_ChannelVisibilityLease:
+    """Integration between the Channel/QoS and the visibility lease."""
+
+    def setup_method(self):
+        # Channels capture the hub at construction time; ensure a loop is
+        # current even when no worker is booting the test process.
+        from kombu.asynchronous import Hub, get_event_loop, set_event_loop
+        self._prev_loop = get_event_loop()
+        set_event_loop(Hub())
+        # Channel.__init__ lists queues, so replace the SQS client at the
+        # class level (same approach as test_Channel.setup_method).
+        self._orig_sqs = SQS.Channel.sqs
+        self.sqs_client = Mock(name='sqs-client')
+        self.sqs_client.list_queues.return_value = {'QueueUrls': []}
+
+        def sqs(channel_self, queue=None):
+            return self.sqs_client
+
+        SQS.Channel.sqs = sqs
+
+    def teardown_method(self):
+        from kombu.asynchronous import set_event_loop
+        SQS.Channel.sqs = self._orig_sqs
+        set_event_loop(self._prev_loop)
+
+    def _connection(self, transport_options=None):
+        conn = Connection(transport=SQS.Transport,
+                          transport_options=transport_options or {})
+        channel = conn.channel()
+        # These tests are not about shutdown restore semantics.
+        channel.qos.restore_at_shutdown = False
+        return conn, channel
+
+    def _delivered_message(self, tag='rh-1', queue='unittest',
+                           queue_url='https://sqs/x/unittest'):
+        message = Mock(name='message')
+        message.delivery_tag = tag
+        message.delivery_info = {
+            'routing_key': queue,
+            'sqs_queue': queue_url,
+            'sqs_message': {'ReceiptHandle': tag},
+        }
+        return message
+
+    def test_disabled_by_default(self):
+        conn, channel = self._connection()
+        assert channel.visibility_lease_enabled is False
+        message = self._delivered_message()
+        channel.qos.append(message, message.delivery_tag)
+        assert 'visibility_lease' not in channel.__dict__
+
+    def test_qos_append_starts_lease_when_enabled(self):
+        conn, channel = self._connection(
+            {'visibility_lease': {'interval': 30, 'timeout': 60}})
+        assert channel.visibility_lease_enabled is True
+        message = self._delivered_message()
+        channel.qos.append(message, message.delivery_tag)
+        lease = channel.visibility_lease
+        assert lease.active_count() == 1
+        entry = lease._entries['rh-1']
+        assert entry.receipt_handle == 'rh-1'
+        assert entry.timer is not None
+        conn.close()
+
+    def test_basic_ack_stops_lease_and_deletes_message(self):
+        conn, channel = self._connection(
+            {'visibility_lease': {'interval': 30, 'timeout': 60}})
+        message = self._delivered_message()
+        channel.qos.append(message, message.delivery_tag)
+
+        channel.basic_ack('rh-1')
+
+        self.sqs_client.delete_message.assert_called_once_with(
+            QueueUrl='https://sqs/x/unittest', ReceiptHandle='rh-1')
+        assert channel.visibility_lease.active_count() == 0
+        conn.close()
+
+    def test_basic_reject_after_in_flight_renewal_is_ordered(self):
+        conn, channel = self._connection({
+            'visibility_lease': {'interval': 30, 'timeout': 60},
+            'predefined_queues': {
+                'unittest': {
+                    'url': 'https://sqs/x/unittest',
+                    'backoff_tasks': ['svc.tasks.task1'],
+                    'backoff_policy': {1: 42},
+                }}})
+        message = self._delivered_message()
+        message.headers = {'task': 'svc.tasks.task1'}
+        message.properties = {'delivery_info': {'sqs_message': {
+            'Attributes': {'ApproximateReceiveCount': 1}}}}
+        channel.qos.append(message, message.delivery_tag)
+        lease = channel.visibility_lease
+
+        # Put the renewal in flight, then reject while it is pending.
+        entry = lease._entries['rh-1']
+        entry.in_flight = True
+        entry.settle_callbacks = []
+        # Predefined-queue backoff issues the visibility change through
+        # the (per-queue) sync boto client.
+        sqs_client = Mock(name='sqs-client')
+        channel.sqs = Mock(name='sqs')
+        channel.sqs.return_value = sqs_client
+
+        channel.qos.reject('rh-1')
+        # Neither QoS bookkeeping backoff visibility change must happen
+        # before the renewal response settles.
+        sqs_client.change_message_visibility.assert_not_called()
+
+        # The renewal response settles: only now may the reject/backoff
+        # visibility change be issued.
+        callbacks = lease._finish_request_locked(entry)
+        lease._run_callbacks(callbacks)
+        sqs_client.change_message_visibility.assert_called_once_with(
+            QueueUrl='https://sqs/x/unittest',
+            ReceiptHandle='rh-1', VisibilityTimeout=42)
+        conn.close()
+
+    def test_renewal_flows_through_real_hub_timer(self):
+        conn, channel = self._connection(
+            {'visibility_lease': {'interval': 30, 'timeout': 60}})
+        message = self._delivered_message()
+        channel.qos.append(message, message.delivery_tag)
+
+        async_client = _FakeAsyncSQS()
+        channel.asynsqs = Mock(return_value=async_client)
+
+        # The hub applies a scheduled entry by simply calling it.
+        entry = channel.visibility_lease._entries['rh-1']
+        first_timer = entry.timer
+        first_timer()
+        assert len(async_client.requests) == 1
+        assert async_client.requests[0]['url'] == \
+            'https://sqs/x/unittest'
+        assert async_client.requests[0]['entries'] == [{
+            'Id': '0', 'ReceiptHandle': 'rh-1', 'VisibilityTimeout': 60}]
+
+        # A successful response reschedules the next renewal.
+        async_client.succeed(ids=[0])
+        assert channel.visibility_lease._entries['rh-1'].timer \
+            is not first_timer
+        conn.close()
+
+    def test_basic_cancel_stops_queued_leases(self):
+        conn, channel = self._connection(
+            {'visibility_lease': {'interval': 30, 'timeout': 60}})
+        channel.basic_consume('unittest', no_ack=False, callback=Mock(),
+                              consumer_tag='ctag')
+        message = self._delivered_message()
+        channel.qos.append(message, message.delivery_tag)
+        timer = channel.visibility_lease._entries['rh-1'].timer
+
+        channel.basic_cancel('ctag')
+
+        assert timer.canceled is True
+        assert channel.visibility_lease.active_count() == 0
+        conn.close()
+
+    def test_close_stops_all_leases(self):
+        conn, channel = self._connection(
+            {'visibility_lease': {'interval': 30, 'timeout': 60}})
+        for tag in ('rh-1', 'rh-2'):
+            channel.qos.append(self._delivered_message(tag), tag)
+        channel.close()
+        assert channel.visibility_lease.closed is True
+        assert channel.visibility_lease.active_count() == 0
+
+    def test_no_ack_consumption_never_starts_a_lease(self):
+        conn, channel = self._connection(
+            {'visibility_lease': {'interval': 30, 'timeout': 60}})
+        channel._noack_queues.add('unittest')
+        channel.asynsqs = Mock(name='asynsqs')
+        raw = {
+            'Body': '{}',
+            'ReceiptHandle': 'rh-noack',
+            'Attributes': {},
+        }
+        channel._message_to_python(
+            raw, 'unittest', 'https://sqs/x/unittest')
+        # no_ack messages are deleted on receive and bypass QoS.
+        channel.asynsqs.return_value.delete_message.assert_called_once()
+        assert channel.visibility_lease.active_count() == 0
+        conn.close()
+
+    def test_fifo_predefined_queue_renews_per_queue_setting(self):
+        conn, channel = self._connection({
+            'predefined_queues': {
+                'queue-3.fifo': {
+                    'url': 'https://sqs/x/queue-3.fifo',
+                    'visibility_lease': {'interval': 7, 'timeout': 14},
+                }}})
+        message = self._delivered_message(
+            'rh-fifo', queue='queue-3.fifo',
+            queue_url='https://sqs/x/queue-3.fifo')
+        channel.qos.append(message, 'rh-fifo')
+        lease = channel.visibility_lease
+        entry = lease._entries['rh-fifo']
+        assert entry.qname == 'queue-3.fifo'
+        assert entry.config['interval'] == 7.0
+        assert entry.config['timeout'] == 14
+        conn.close()
