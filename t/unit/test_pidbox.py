@@ -63,10 +63,11 @@ class test_Mailbox:
         mailbox = pidbox.Mailbox('test_reply__collect')(self.connection)
         exchange = mailbox.reply_exchange.name
         channel = self.connection.channel()
-        mailbox.reply_queue(channel).declare()
 
         ticket = uuid()
-        mailbox._publish_reply({'foo': 'bar'}, exchange, mailbox.oid, ticket)
+        mailbox.get_ticket_reply_queue(ticket)(channel).declare()
+        mailbox._publish_reply({'foo': 'bar'}, exchange,
+                               mailbox.ticket_routing_key(ticket), ticket)
         _callback_called = [False]
 
         def callback(body):
@@ -78,25 +79,144 @@ class test_Mailbox:
         assert _callback_called[0]
 
         ticket = uuid()
-        mailbox._publish_reply({'biz': 'boz'}, exchange, mailbox.oid, ticket)
+        mailbox.get_ticket_reply_queue(ticket)(channel).declare()
+        mailbox._publish_reply({'biz': 'boz'}, exchange,
+                               mailbox.ticket_routing_key(ticket), ticket)
         reply = mailbox._collect(ticket, limit=1, channel=channel)
         assert reply == [{'biz': 'boz'}]
 
-        mailbox._publish_reply({'foo': 'BAM'}, exchange, mailbox.oid, 'doom',
-                               serializer='pickle')
-        with pytest.raises(ContentDisallowed):
-            reply = mailbox._collect('doom', limit=1, channel=channel)
+        ticket = 'doom'
+        mailbox.get_ticket_reply_queue(ticket)(channel).declare()
         mailbox._publish_reply(
-            {'foo': 'BAMBAM'}, exchange, mailbox.oid, 'doom',
+            {'foo': 'BAM'}, exchange,
+            mailbox.ticket_routing_key(ticket), ticket,
             serializer='pickle',
         )
-        reply = mailbox._collect('doom', limit=1, channel=channel,
+        with pytest.raises(ContentDisallowed):
+            reply = mailbox._collect(ticket, limit=1, channel=channel)
+        mailbox._publish_reply(
+            {'foo': 'BAMBAM'}, exchange,
+            mailbox.ticket_routing_key(ticket), ticket,
+            serializer='pickle',
+        )
+        reply = mailbox._collect(ticket, limit=1, channel=channel,
                                  accept=['pickle'])
         assert reply[0]['foo'] == 'BAMBAM'
 
         de = mailbox.connection.drain_events = Mock()
         de.side_effect = socket.timeout
-        mailbox._collect(ticket, limit=1, channel=channel)
+        mailbox._collect(uuid(), limit=1, channel=channel)
+
+    def test_reply__collect_completes_before_timeout(self):
+        mailbox = pidbox.Mailbox('test_collect_complete')(self.connection)
+        exchange = mailbox.reply_exchange.name
+        channel = self.connection.channel()
+
+        ticket = uuid()
+        mailbox.get_ticket_reply_queue(ticket)(channel).declare()
+        mailbox._publish_reply({'foo': 'bar'}, exchange,
+                               mailbox.ticket_routing_key(ticket), ticket)
+
+        collected = mailbox._collect(ticket, limit=1, timeout=10,
+                                     channel=channel)
+        assert collected == [{'foo': 'bar'}]
+
+    def test_late_reply_to_old_ticket_not_stolen_by_next_ticket(self):
+        mailbox = pidbox.Mailbox('test_ticket_isolation')(self.connection)
+        exchange = mailbox.reply_exchange.name
+        channel = self.connection.channel()
+
+        ticket_a = uuid()
+        mailbox.get_ticket_reply_queue(ticket_a)(channel).declare()
+        # Command A has timed out; its reply shows up only afterwards.
+        mailbox._publish_reply({'a': 1}, exchange,
+                               mailbox.ticket_routing_key(ticket_a), ticket_a)
+
+        ticket_b = uuid()
+        mailbox.get_ticket_reply_queue(ticket_b)(channel).declare()
+        with patch.object(mailbox.connection, 'drain_events',
+                          side_effect=socket.timeout):
+            b_replies = mailbox._collect(ticket_b, limit=1, channel=channel)
+        # The next command must not swallow A's late reply.
+        assert b_replies == []
+
+        # A's reply is still waiting on A's own ticket queue.
+        a_replies = mailbox._collect(ticket_a, limit=1, channel=channel)
+        assert a_replies == [{'a': 1}]
+
+    def test_collect_callback_exception_does_not_swallow_replies(self):
+        mailbox = pidbox.Mailbox('test_callback_isolated')(self.connection)
+        exchange = mailbox.reply_exchange.name
+        channel = self.connection.channel()
+
+        seen = []
+
+        def callback(body):
+            seen.append(body)
+            if body == {'i': 1}:
+                raise KeyError('boom')
+
+        ticket = uuid()
+        mailbox.get_ticket_reply_queue(ticket)(channel).declare()
+        for i in range(2):
+            mailbox._publish_reply(
+                {'i': i + 1}, exchange,
+                mailbox.ticket_routing_key(ticket), ticket,
+            )
+
+        replies = mailbox._collect(ticket, limit=2, channel=channel,
+                                   callback=callback)
+        assert replies == [{'i': 1}, {'i': 2}]
+        assert seen == [{'i': 1}, {'i': 2}]
+
+    def test_connection_loss_ends_collect_and_tracks_pending_cleanup(self):
+        mailbox = pidbox.Mailbox('test_connection_loss')(self.connection)
+        channel = self.connection.channel()
+        conn_error = self.connection.connection_errors[0]
+        ticket = uuid()
+
+        with patch.object(channel, 'after_reply_message_received',
+                          side_effect=conn_error('closed')):
+            with patch.object(mailbox.connection, 'drain_events',
+                              side_effect=conn_error('closed')):
+                replies = mailbox._collect(ticket, limit=2, channel=channel)
+
+        assert replies == []
+        assert ticket in [
+            name.split('.')[1] for name in mailbox._pending_cleanup
+        ]
+
+        # Same connection recovered: deletion succeeds and the pending
+        # entry is discarded.
+        with patch.object(channel, 'queue_delete'):
+            mailbox._retry_pending_cleanup(channel)
+        assert not mailbox._pending_cleanup
+
+    def test_pending_cleanup_tolerates_already_gone_queue(self):
+        mailbox = pidbox.Mailbox('test_cleanup_404')(self.connection)
+        channel = self.connection.channel()
+
+        class NotFound(self.connection.channel_errors[0]):
+            code = 404
+
+        mailbox._pending_cleanup.add('ghost.reply.queue')
+        with patch.object(channel, 'queue_delete',
+                          side_effect=NotFound()):
+            mailbox._retry_pending_cleanup(channel)
+        assert not mailbox._pending_cleanup
+
+    def test_broadcast_publish_failure_cleans_ticket_up(self):
+        mailbox = pidbox.Mailbox('test_publish_failure')(self.connection)
+        channel = self.connection.channel()
+        with patch.object(mailbox, '_publish',
+                          side_effect=KeyError('publish failed')):
+            with patch.object(channel, 'after_reply_message_received') as hook:
+                with pytest.raises(KeyError):
+                    mailbox._broadcast('mymethod', reply=True,
+                                       channel=channel)
+                hook.assert_called_once()
+        assert not mailbox._pending_cleanup
+        assert not mailbox._tickets
 
     def test_reply__collect_uses_default_channel(self):
         class ConsumerCalled(Exception):
@@ -445,4 +565,62 @@ class test_PidboxOid:
         with ThreadPoolExecutor() as e:
             res = e.submit(getoid)
             subprocess_oid = res.result()
-        assert subprocess_oid != oid
+            assert subprocess_oid != oid
+
+
+class test_PidboxTicket:
+
+    def ticket(self, **kwargs):
+        return pidbox.PidboxTicket(
+            kwargs.pop('id', 'T'), Mock(name='queue'), **kwargs,
+        )
+
+    def test_open_close_lifecycle(self):
+        ticket = self.ticket()
+        assert not ticket.is_open
+        ticket.open()
+        assert ticket.is_open
+        assert ticket.close('complete')
+        assert not ticket.is_open
+        assert ticket.reason == 'complete'
+        # Second close is a no-op; the first reason wins.
+        assert not ticket.close('timeout')
+        assert ticket.reason == 'complete'
+
+    def test_deliver_collects_while_open(self):
+        ticket = self.ticket(limit=2)
+        ticket.open()
+        assert ticket.deliver({'a': 1})
+        assert ticket.responses == [{'a': 1}]
+        # Limit reached on the second reply.
+        assert not ticket.deliver({'a': 2})
+        assert ticket.responses == [{'a': 1}, {'a': 2}]
+
+    def test_deliver_after_close_is_late(self):
+        ticket = self.ticket()
+        ticket.open()
+        ticket.close('timeout')
+        assert not ticket.deliver({'late': True})
+        assert ticket.responses == []
+        assert ticket.late_responses == 1
+        ticket.note_late()
+        assert ticket.late_responses == 2
+
+    def test_callback_exception_does_not_block_delivery(self):
+        seen = []
+
+        def callback(body):
+            seen.append(body)
+            raise RuntimeError('boom')
+
+        ticket = self.ticket(callback=callback)
+        ticket.open()
+        # The callback raises, but the reply is still collected.
+        assert ticket.deliver({'x': 1})
+        assert seen == [{'x': 1}]
+        assert ticket.responses == [{'x': 1}]
+
+    def test_begin_finish_runs_once(self):
+        ticket = self.ticket()
+        assert ticket.begin_finish()
+        assert not ticket.begin_finish()

@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "命令发布、回复队列声明和收集使用同一唯一票据，票据状态可在整个调用生命周期追踪。"
+  - id: 2
+    type: f2p
+    text: "只有票据开放且 destination/pattern/matcher 匹配的回复会交给该调用，其他回复不会串入。"
+  - id: 3
+    type: f2p
+    text: "达到数量、超时、取消或连接关闭都会先原子关闭票据，再停止 consumer 和删除临时资源。"
+  - id: 4
+    type: f2p
+    text: "consumer 或队列删除失败会进入待清理状态，不把调用假报为仍在等待。"
+  - id: 5
+    type: f2p
+    text: "同一连接恢复或新连接建立后重试待清理资源，成功后移除记录且不影响新票据。"
+  - id: 6
+    type: f2p
+    text: "并发 multi_call 的回复和清理互相隔离，单个回调异常不会吞掉其他有效回复。"
+  - id: 7
+    type: f2p
+    text: "关闭后的迟到回复被丢弃并可计数，不延长超时，也不会被后续调用接收。"
+  - id: 8
+    type: p2p
+    text: "单次 call、无回复 broadcast、既有 matcher 和正常按 limit 返回的行为保持兼容。"

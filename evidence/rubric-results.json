@@ -1,0 +1,42 @@
+[
+  {
+    "id": 1,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 2,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 3,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 4,
+    "passed": false,
+    "reason": "_finish 捕获 consumer.cancel() 异常后只写 debug 日志，仍调用 _delete_reply_queue 并继续返回。"
+  },
+  {
+    "id": 5,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 6,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 7,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 8,
+    "passed": true,
+    "reason": ""
+  }
+]

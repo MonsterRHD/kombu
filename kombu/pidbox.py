@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import socket
+import threading
 import warnings
-from collections import defaultdict, deque
 from contextlib import contextmanager
 from copy import copy
-from itertools import count
 from time import time
 
 from . import Consumer, Exchange, Producer, Queue
@@ -16,11 +15,18 @@ from .common import maybe_declare, oid_from
 from .exceptions import InconsistencyError
 from .log import get_logger
 from .matcher import match
+from .transport.base import StdChannel
 from .utils.functional import maybe_evaluate, reprcall
 from .utils.objects import cached_property
 from .utils.uuid import uuid
 
 REPLY_QUEUE_EXPIRES = 10
+
+#: terminal reasons recorded on a closed request ticket.
+TICKET_COMPLETE = 'complete'
+TICKET_TIMEOUT = 'timeout'
+TICKET_CANCELLED = 'cancelled'
+TICKET_CONNECTION_CLOSED = 'connection_closed'
 
 W_PIDBOX_IN_USE = """\
 A node named {node.hostname} is already using this process mailbox!
@@ -30,7 +36,7 @@ Or if you meant to start multiple nodes on the same host please make sure
 you give each node a unique node name!
 """
 
-__all__ = ('Node', 'Mailbox')
+__all__ = ('Node', 'Mailbox', 'PidboxTicket')
 logger = get_logger(__name__)
 debug, error = logger.debug, logger.error
 
@@ -158,6 +164,119 @@ class Node:
                                     serializer=self.mailbox.serializer)
 
 
+class PidboxTicket:
+    """Trackable ticket for a single pidbox reply request.
+
+    A ticket ties together publishing the command, declaring the
+    (temporary) reply queue and collecting the replies. Replies are only
+    handed to the caller while the ticket is *open*. Once it has been
+    closed -- reply limit reached, timeout, cancellation or connection
+    close -- late replies are dropped and counted instead of extending
+    the wait.
+    """
+
+    def __init__(self, ticket, queue, limit=None, timeout=1, callback=None):
+        #: Ticket identifier (correlates replies with this request).
+        self.ticket = ticket
+
+        #: (bound or unbound) reply Queue used by this request.
+        self.queue = queue
+
+        #: Maximum number of replies to wait for (``None``: timeout only).
+        self.limit = limit
+
+        #: Timeout used while waiting for the next reply.
+        self.timeout = timeout
+
+        #: Optional per-reply callback.
+        self.callback = callback
+
+        #: Collected reply bodies.
+        self.responses = []
+
+        #: Number of replies that arrived after the ticket had closed.
+        self.late_responses = 0
+
+        #: Consumer collecting replies (set by :meth:`Mailbox._collect`).
+        self.consumer = None
+
+        self._open = False
+        self._finished = False
+        self._reason = None
+        self._lock = threading.RLock()
+
+    def open(self):
+        """Open the ticket, accepting replies."""
+        with self._lock:
+            self._open = True
+            self._reason = None
+
+    def close(self, reason):
+        """Close the ticket.
+
+        The first close wins; return :const:`True` when the caller
+        performed the transition. Subsequent calls are no-ops.
+        """
+        with self._lock:
+            if not self._open:
+                return False
+            self._open = False
+            self._reason = reason
+            return True
+
+    @property
+    def is_open(self):
+        return self._open
+
+    @property
+    def reason(self):
+        """Terminal reason once the ticket has been closed."""
+        return self._reason
+
+    def begin_finish(self):
+        """Mark the shutdown sequence as started.
+
+        Return :const:`True` for the first caller only so consumer
+        cancellation and queue deletion happen exactly once.
+        """
+        with self._lock:
+            if self._finished:
+                return False
+            self._finished = True
+            return True
+
+    def note_late(self):
+        """Record a reply that arrived after the ticket ended."""
+        with self._lock:
+            self.late_responses += 1
+
+    def deliver(self, body):
+        """Hand a matched reply to the waiting caller.
+
+        Returns :const:`False` once the ticket is closed or the reply
+        limit has been reached. Exceptions raised by the user callback
+        are logged and never prevent further replies from being
+        collected.
+        """
+        with self._lock:
+            if not self._open:
+                self.late_responses += 1
+                return False
+            if self.callback is not None:
+                try:
+                    self.callback(body)
+                except Exception as exc:
+                    logger.error(
+                        'pidbox reply callback raised: %r', exc, exc_info=1,
+                    )
+            # The ticket may have been closed while the callback ran.
+            if not self._open:
+                self.late_responses += 1
+                return False
+            self.responses.append(body)
+            return not (self.limit and len(self.responses) >= self.limit)
+
+
 class Mailbox:
     """Process Mailbox."""
 
@@ -198,7 +317,12 @@ class Mailbox:
         self.clock = LamportClock() if clock is None else clock
         self.exchange = self._get_exchange(self.namespace, self.type)
         self.reply_exchange = self._get_reply_exchange(self.namespace)
-        self.unclaimed = defaultdict(deque)
+        # live request tickets: ticket id -> PidboxTicket
+        self._tickets = {}
+        self._tickets_lock = threading.Lock()
+        # names of reply queues whose deletion failed and must be retried
+        self._pending_cleanup = set()
+        self._cleanup_lock = threading.Lock()
         self.accept = self.accept if accept is None else accept
         self.serializer = self.serializer if serializer is None else serializer
         self.queue_ttl = queue_ttl
@@ -246,6 +370,24 @@ class Mailbox:
                                timeout=timeout, limit=limit,
                                callback=callback,
                                channel=channel)
+
+    def ticket_routing_key(self, ticket):
+        """Routing key (and binding) of a ticket's reply queue."""
+        return f'{self.oid}.{ticket}'
+
+    def get_ticket_reply_queue(self, ticket):
+        """Temporary reply queue dedicated to a single request ticket."""
+        routing_key = self.ticket_routing_key(ticket)
+        return Queue(
+            f'{routing_key}.{self.reply_exchange.name}',
+            exchange=self.reply_exchange,
+            routing_key=routing_key,
+            durable=self.queue_durable,
+            exclusive=self.queue_exclusive,
+            auto_delete=not self.queue_durable,
+            expires=self.reply_queue_expires,
+            message_ttl=self.reply_queue_ttl,
+        )
 
     def get_reply_queue(self):
         oid = self.oid
@@ -315,10 +457,11 @@ class Mailbox:
         chan = channel or self.connection.default_channel
         exchange = self.exchange
         if reply_ticket:
-            maybe_declare(self.reply_queue(chan))
+            reply_queue = self.get_ticket_reply_queue(reply_ticket)
+            maybe_declare(reply_queue(chan))
             message.update(ticket=reply_ticket,
                            reply_to={'exchange': self.reply_exchange.name,
-                                     'routing_key': self.oid})
+                                     'routing_key': reply_queue.routing_key})
         serializer = serializer or self.serializer
         with self.producer_or_acquire(producer, chan) as producer:
             producer.publish(
@@ -353,36 +496,64 @@ class Mailbox:
             limit = destination and len(destination) or None
 
         serializer = serializer or self.serializer
-        self._publish(command, arguments, destination=destination,
-                      reply_ticket=reply_ticket,
-                      channel=chan,
-                      timeout=timeout,
-                      serializer=serializer,
-                      pattern=pattern,
-                      matcher=matcher)
 
-        if reply_ticket:
-            return self._collect(reply_ticket, limit=limit,
-                                 timeout=timeout,
-                                 callback=callback,
-                                 channel=chan)
+        if not reply_ticket:
+            # cast / abcast: no reply queue, no ticket to track.
+            self._publish(command, arguments, destination=destination,
+                          channel=chan, timeout=timeout,
+                          serializer=serializer,
+                          pattern=pattern, matcher=matcher)
+            return
 
-    def _collect(self, ticket,
-                 limit=None, timeout=1, callback=None,
+        # Retry queues left behind by earlier failed deletions, now that
+        # the (possibly recovered/new) connection has a usable channel.
+        self._retry_pending_cleanup(chan)
+
+        # Publish, queue declaration and collection share one ticket that
+        # is opened before any of them takes place.
+        ticket = PidboxTicket(
+            reply_ticket, self.get_ticket_reply_queue(reply_ticket)(chan),
+            limit=limit, timeout=timeout, callback=callback,
+        )
+        self._register_ticket(ticket)
+        ticket.open()
+        try:
+            maybe_declare(ticket.queue)
+            self._publish(command, arguments, destination=destination,
+                          reply_ticket=reply_ticket,
+                          channel=chan,
+                          timeout=timeout,
+                          serializer=serializer,
+                          pattern=pattern,
+                          matcher=matcher)
+        except BaseException:
+            # Publication/declaration failure: terminate before unwinding.
+            self._terminate(ticket, TICKET_CANCELLED, chan)
+            raise
+
+        return self._collect(ticket, channel=chan)
+
+    def _collect(self, ticket, limit=None, timeout=1, callback=None,
                  channel=None, accept=None):
+        # Allow callers to pass a raw ticket id: adopt it with a fresh
+        # ticket-scoped reply queue.
+        if isinstance(ticket, str):
+            ticket = PidboxTicket(
+                ticket, self.get_ticket_reply_queue(ticket),
+                limit=limit, timeout=timeout, callback=callback,
+            )
+            self._register_ticket(ticket)
+            ticket.open()
+
         if accept is None:
             accept = self.accept
         chan = channel or self.connection.default_channel
-        queue = self.reply_queue
+        if not ticket.queue.is_bound or ticket.queue.channel is not chan:
+            ticket.queue = ticket.queue(chan)
+        queue = ticket.queue
         consumer = Consumer(chan, [queue], accept=accept, no_ack=True)
-        responses = []
-        unclaimed = self.unclaimed
+        ticket.consumer = consumer
         adjust_clock = self.clock.adjust
-
-        try:
-            return unclaimed.pop(ticket)
-        except KeyError:
-            pass
 
         def on_message(body, message):
             # ticket header added in kombu 2.5
@@ -391,25 +562,176 @@ class Mailbox:
             expires = header('expires')
             if expires and time() > expires:
                 return
-            this_id = header('ticket', ticket)
-            if this_id == ticket:
-                if callback:
-                    callback(body)
-                responses.append(body)
-            else:
-                unclaimed[this_id].append(body)
+            this_id = header('ticket')
+            # Replies must carry our ticket id; an unknown/missing id is
+            # never attributed to the current (next) command.
+            if this_id is None or this_id != ticket.ticket:
+                return
+            if not ticket.is_open:
+                # in-flight reply racing the consumer cancel: drop it.
+                ticket.note_late()
+                return
+            if not ticket.deliver(body):
+                # Limit reached (or ticket closed concurrently): close the
+                # ticket only -- the drain loop exits and performs the
+                # consumer cancel + queue deletion afterwards, so we never
+                # issue a synchronous basic_cancel from inside a callback.
+                ticket.close(TICKET_COMPLETE)
 
         consumer.register_callback(on_message)
         try:
             with consumer:
-                for i in limit and range(limit) or count():
+                while ticket.is_open:
                     try:
-                        self.connection.drain_events(timeout=timeout)
+                        self.connection.drain_events(timeout=ticket.timeout)
                     except socket.timeout:
+                        ticket.close(TICKET_TIMEOUT)
                         break
-                return responses
+                    except self._collect_errors() as exc:
+                        debug('pidbox connection lost while waiting for '
+                              'replies: %r', exc)
+                        ticket.close(TICKET_CONNECTION_CLOSED)
+                        break
+            return ticket.responses
         finally:
-            chan.after_reply_message_received(queue.name)
+            # Runs exactly once: cancels the consumer and deletes (or
+            # records for retry) the temporary reply queue. This also
+            # covers caller cancellation, i.e. any other exception
+            # unwinding through collect.
+            ticket.close(TICKET_CANCELLED)
+            self._finish(ticket, chan)
+
+    def _collect_errors(self):
+        conn = self.connection
+        return conn.connection_errors + conn.channel_errors
+
+    def _register_ticket(self, ticket):
+        with self._tickets_lock:
+            self._tickets[ticket.ticket] = ticket
+
+    def _unregister_ticket(self, ticket):
+        with self._tickets_lock:
+            self._tickets.pop(ticket.ticket, None)
+
+    def get_active_ticket(self, ticket_id):
+        """Return the live ticket with the given id, if any."""
+        with self._tickets_lock:
+            return self._tickets.get(ticket_id)
+
+    def _terminate(self, ticket, reason, chan=None):
+        """Close ticket and run the shutdown sequence (idempotent)."""
+        if ticket.close(reason):
+            debug('pidbox ticket %s closed (%s)', ticket.ticket, reason)
+        self._finish(
+            ticket, chan if chan is not None else ticket.queue.channel,
+        )
+
+    def _finish(self, ticket, chan):
+        """Stop consumer and delete the reply queue; runs exactly once.
+
+        The ticket must already be closed, so replies racing the shutdown
+        are dropped (and counted) instead of being collected.
+        """
+        if not ticket.begin_finish():
+            return
+        self._unregister_ticket(ticket)
+
+        # Stop the consumer before deleting the temporary resource.
+        consumer = ticket.consumer
+        if consumer is not None:
+            try:
+                consumer.cancel()
+            except Exception as exc:
+                debug('pidbox consumer cancel failed: %r', exc)
+
+        if chan is None or not self._delete_reply_queue(ticket.queue, chan):
+            if chan is None:
+                debug('pidbox reply queue %r left without a usable channel',
+                      ticket.queue.name)
+            with self._cleanup_lock:
+                self._pending_cleanup.add(ticket.queue.name)
+            logger.warning(
+                'pidbox reply queue %r could not be deleted; it will be '
+                'retried as soon as a connection is available.',
+                ticket.queue.name,
+            )
+
+    def _delete_reply_queue(self, queue, chan):
+        """Best-effort deletion of a temporary reply queue.
+
+        Returns :const:`True` when the queue is deleted, or deletion is
+        handled by the transport / cannot leak.
+        """
+        name = queue.name
+        conn = self.connection
+        try:
+            chan.after_reply_message_received(name)
+        except conn.connection_errors + conn.channel_errors as exc:
+            debug('pidbox reply queue %r could not be deleted: %r',
+                  name, exc)
+            return False
+        except Exception as exc:  # defensive: cleanup must never raise
+            debug('pidbox reply queue %r cleanup failed: %r', name, exc)
+            return False
+
+        # AMQP transports leave after_reply_message_received as a no-op and
+        # rely on queue flags; delete explicitly so a dropped connection
+        # cannot leave the queue behind.
+        if type(chan).after_reply_message_received is \
+                StdChannel.after_reply_message_received:
+            bound = queue if queue.is_bound else queue(chan)
+            try:
+                bound.delete()
+            except conn.channel_errors as exc:
+                if getattr(exc, 'code', None) == 404:
+                    # Queue already gone (e.g. auto-delete after consumer
+                    # cancel or exclusive removal with a dead connection).
+                    return True
+                debug('pidbox reply queue %r could not be deleted: %r',
+                      name, exc)
+                return False
+            except conn.connection_errors as exc:
+                debug('pidbox reply queue %r could not be deleted: %r',
+                      name, exc)
+                return False
+            except Exception as exc:
+                debug('pidbox reply queue %r cleanup failed: %r', name, exc)
+                return False
+        return True
+
+    def _retry_pending_cleanup(self, chan):
+        """Retry deleting queues whose earlier deletion failed.
+
+        Called when the same connection has recovered or a new connection
+        (with a fresh channel) is available.
+        """
+        with self._cleanup_lock:
+            pending = list(self._pending_cleanup)
+        if not pending:
+            return
+        conn = self.connection
+        for name in pending:
+            try:
+                chan.queue_delete(queue=name)
+            except conn.channel_errors as exc:
+                if getattr(exc, 'code', None) == 404:
+                    # Queue already gone.
+                    pass
+                else:
+                    # The channel is suspect: keep the resource pending and
+                    # wait for the next usable connection.
+                    debug('pidbox pending cleanup aborted: %r', exc)
+                    return
+            except conn.connection_errors as exc:
+                # Connection unusable again; keep everything pending.
+                debug('pidbox pending cleanup aborted: %r', exc)
+                return
+            except Exception as exc:
+                # Unknown failure: don't risk forgetting a real resource.
+                debug('pidbox pending cleanup of %r failed: %r', name, exc)
+                continue
+            with self._cleanup_lock:
+                self._pending_cleanup.discard(name)
 
     def _get_exchange(self, namespace, type):
         return Exchange(self.exchange_fmt % namespace,
