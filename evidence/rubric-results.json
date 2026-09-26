@@ -17,7 +17,7 @@
   {
     "id": 4,
     "passed": false,
-    "reason": "_finish 捕获 consumer.cancel() 异常后只写 debug 日志，仍调用 _delete_reply_queue 并继续返回。"
+    "reason": "完成函数捕获消费者取消异常后只写调试日志，仍删除回复队列并继续返回。"
   },
   {
     "id": 5,
