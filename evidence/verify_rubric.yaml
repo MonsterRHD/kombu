@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "发布通过同一文件系统的临时写入、文件同步和原子公布完成，消费者不会读到截断或未完成消息。"
+  - id: 2
+    type: f2p
+    text: "消费者原子取得带期限的领取租约，多进程竞争同一消息时只有一个有效领取者。"
+  - id: 3
+    type: f2p
+    text: "成功确认后消息才删除或进入 processed，确认失败保留可恢复状态且不会假报成功。"
+  - id: 4
+    type: f2p
+    text: "reject(requeue=True) 将原消息标识重新公布，reject(requeue=False) 按既有丢弃语义最终化。"
+  - id: 5
+    type: f2p
+    text: "进程在发布或领取任一点崩溃后，扫描能隔离临时文件并回收过期租约，不永久丢失已公布消息。"
+  - id: 6
+    type: f2p
+    text: "输入、输出和 processed 目录跨设备且无法原子移动时启动即明确报错。"
+  - id: 7
+    type: p2p
+    text: "现有最终文件命名仍可消费，新消息的稳定标识在重排和恢复后保持不变。"
+  - id: 8
+    type: f2p
+    text: "queue size、purge 和 processed 模式只统计相应已公布或已确认消息，不把临时/租约文件计入。"

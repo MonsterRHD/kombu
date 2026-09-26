@@ -4,6 +4,8 @@ import contextlib
 import os
 import shutil
 import tempfile
+import time
+import uuid
 from pathlib import PurePosixPath, PureWindowsPath
 from queue import Empty
 from typing import Generator
@@ -13,9 +15,15 @@ import pytest
 
 import t.skip
 from kombu import Connection, Consumer, Exchange, Producer, Queue
-from kombu.exceptions import ChannelError
-from kombu.transport.filesystem import Channel as FilesystemChannel
+from kombu.exceptions import ChannelError, OperationalError
+from kombu.transport import filesystem as filesystem_transport
+from kombu.transport.filesystem import (
+    QUARANTINE_DIR,
+    Channel as FilesystemChannel,
+)
 from kombu.transport.virtual import Channel
+from kombu.utils.encoding import bytes_to_str, str_to_bytes
+from kombu.utils.json import dumps, loads
 
 
 class WithJanitorMixin:
@@ -382,12 +390,373 @@ class test_FilesystemLock(WithJanitorMixin):
             "kombu.transport.filesystem.unlock"
         ) as unlock_m:
             producer.publish({"foo": 1})
-            assert unlock_m.call_count == 2
-            assert lock_m.call_count == 2
+            # publishing only reads the fanout routing table; the message
+            # itself is published with a temp file + atomic rename and needs
+            # no advisory lock
+            assert unlock_m.call_count == 1
+            assert lock_m.call_count == 1
             exchange_file_obj = unlock_m.call_args_list[0][0][0]
-            msg_file_obj = unlock_m.call_args_list[1][0][0]
-            assert lock_m.call_args_list == [call(exchange_file_obj, LOCK_SH),
-                                             call(msg_file_obj, LOCK_EX)]
+            assert lock_m.call_args_list == [call(exchange_file_obj, LOCK_SH)]
+
+
+@t.skip.if_win32
+class test_FilesystemDiskProtocol(WithJanitorMixin):
+    """Durable on-disk protocol: atomic publish, leases, recovery."""
+
+    QUEUE = 'diskq'
+
+    def setup_method(self):
+        try:
+            self.data_folder_in = tempfile.mkdtemp()
+            self.data_folder_out = tempfile.mkdtemp()
+            self.control_folder = tempfile.mkdtemp()
+            self.processed_folder = tempfile.mkdtemp()
+        except Exception:
+            pytest.skip('filesystem transport: cannot create tempfiles')
+        self.connections = []
+        self.channels = []
+
+    def teardown_method(self):
+        # make sure we don't attempt to restore messages at shutdown
+        for channel in self.channels:
+            try:
+                channel._qos._dirty.clear()
+                channel._qos._delivered.clear()
+            except AttributeError:
+                pass
+        self._remove_temporary_folders()
+        try:
+            shutil.rmtree(self.processed_folder)
+        except OSError:
+            pass
+
+    def _connection(self, in_folder, out_folder, **options):
+        opts = {
+            'data_folder_in': in_folder,
+            'data_folder_out': out_folder,
+            'control_folder': self.control_folder,
+        }
+        opts.update(options)
+        conn = Connection(transport='filesystem', transport_options=opts)
+        self.connections.append(conn)
+        return conn
+
+    def _channel(self, connection):
+        channel = connection.channel()
+        self.channels.append(channel)
+        return channel
+
+    @property
+    def consumer_conn(self):
+        return self._connection(self.data_folder_in, self.data_folder_out)
+
+    @property
+    def producer_conn(self):
+        return self._connection(self.data_folder_out, self.data_folder_in)
+
+    def _payload(self, body='hello', tag=None):
+        return {
+            'body': body,
+            'properties': {
+                'delivery_tag': tag or str(uuid.uuid4()),
+                'delivery_info': {},
+            },
+            'content-type': 'application/json',
+            'content-encoding': 'utf-8',
+            'headers': {},
+        }
+
+    def _put_raw(self, payload, queue=QUEUE):
+        channel = self._channel(self.producer_conn)
+        channel._put(queue, payload)
+        return channel
+
+    def _entries(self, folder):
+        return [n for n in os.listdir(folder)
+                if os.path.isfile(os.path.join(folder, n))]
+
+    def _ready_names(self, folder):
+        return [n for n in self._entries(folder) if n.endswith('.msg')]
+
+    def _lease_names(self, folder):
+        return [n for n in self._entries(folder) if '.lease.' in n]
+
+    def _expire_lease(self, folder, lease_name):
+        """Rewrite a lease name as if its deadline had passed."""
+        ready, _, suffix = lease_name.partition('.lease.')
+        _, _, token = suffix.rpartition('.')
+        expired_ms = int(time.time() * 1000) - 60_000
+        expired_name = f'{ready}.lease.{expired_ms}.{token}'
+        os.replace(os.path.join(folder, lease_name),
+                   os.path.join(folder, expired_name))
+        return expired_name
+
+    def test_publish_leaves_one_complete_named_file_no_temp(self):
+        tag = str(uuid.uuid4())
+        payload = self._payload(tag=tag)
+        producer = self._channel(self.producer_conn)
+        producer._put(self.QUEUE, payload)
+
+        entries = self._entries(self.data_folder_in)
+        assert len(entries) == 1
+        name = entries[0]
+        assert name == f'{name.split("_")[0]}_{tag}.{self.QUEUE}.msg'
+        # the payload on disk is the complete JSON, never a partial write
+        with open(os.path.join(self.data_folder_in, name), 'rb') as fh:
+            assert loads_bytes(fh.read())['properties']['delivery_tag'] == tag
+
+    def test_stale_temp_file_is_quarantined_and_never_delivered(self):
+        stale = os.path.join(self.data_folder_in, '.tmp.crashed-writer')
+        with open(stale, 'wb') as fh:
+            fh.write(b'{"truncated": ')
+        old = time.time() - 1000
+        os.utime(stale, (old, old))
+
+        channel = self._channel(self.consumer_conn)
+        channel._sweep(force=True)
+
+        assert not os.path.exists(stale)
+        quarantined = os.listdir(
+            os.path.join(self.data_folder_in, QUARANTINE_DIR))
+        assert quarantined == ['.tmp.crashed-writer']
+        assert channel._size(self.QUEUE) == 0
+        with pytest.raises(Empty):
+            channel._get(self.QUEUE)
+
+    def test_recent_temp_file_is_left_for_live_writer(self):
+        channel = self._channel(self.consumer_conn)
+        fresh = os.path.join(self.data_folder_in, '.tmp.in-flight')
+        with open(fresh, 'wb') as fh:
+            fh.write(b'x')
+        channel._sweep(force=True)
+        assert os.path.exists(fresh)
+
+    def test_sweep_is_rate_limited_between_startup_and_polling(self):
+        channel = self._channel(self.consumer_conn)
+        stale = os.path.join(self.data_folder_in, '.tmp.old')
+        with open(stale, 'wb') as fh:
+            fh.write(b'x')
+        old = time.time() - 1000
+        os.utime(stale, (old, old))
+
+        channel._sweep()  # within the recovery interval: must not act
+        assert os.path.exists(stale)
+        channel._sweep(force=True)
+        assert not os.path.exists(stale)
+
+    def test_claim_leaves_lease_and_excludes_it_from_size(self):
+        self._put_raw(self._payload())
+        first = self._channel(self.consumer_conn)
+        competitor = self._channel(self.consumer_conn)
+
+        message = first.basic_get(self.QUEUE)
+        assert message is not None
+        assert self._ready_names(self.data_folder_in) == []
+        assert len(self._lease_names(self.data_folder_in)) == 1
+        assert first._size(self.QUEUE) == 0
+        # a competing consumer cannot get the same message
+        assert competitor.basic_get(self.QUEUE) is None
+
+    def test_ack_deletes_lease(self):
+        self._put_raw(self._payload())
+        channel = self._channel(self.consumer_conn)
+        message = channel.basic_get(self.QUEUE)
+        channel.basic_ack(message.delivery_tag)
+        assert self._entries(self.data_folder_in) == []
+
+    def test_ack_archives_original_name_and_bytes_in_processed_folder(self):
+        tag = str(uuid.uuid4())
+        self._put_raw(self._payload(tag=tag))
+        original_name = self._ready_names(self.data_folder_in)[0]
+        with open(os.path.join(self.data_folder_in, original_name), 'rb') as fh:
+            original_bytes = fh.read()
+
+        conn = self._connection(
+            self.data_folder_in, self.data_folder_out,
+            store_processed=True, processed_folder=self.processed_folder)
+        channel = self._channel(conn)
+        message = channel.basic_get(self.QUEUE)
+        assert os.listdir(self.processed_folder) == []
+        channel.basic_ack(message.delivery_tag)
+
+        assert os.listdir(self.processed_folder) == [original_name]
+        with open(os.path.join(self.processed_folder, original_name), 'rb') as fh:
+            assert fh.read() == original_bytes
+
+    def test_claim_does_not_archive_message_before_ack(self):
+        conn = self._connection(
+            self.data_folder_in, self.data_folder_out,
+            store_processed=True, processed_folder=self.processed_folder)
+        self._put_raw(self._payload())
+        channel = self._channel(conn)
+
+        channel.basic_get(self.QUEUE)
+        assert os.listdir(self.processed_folder) == []
+        assert len(self._lease_names(self.data_folder_in)) == 1
+
+    def test_reject_requeue_restores_original_name_and_identity(self):
+        tag = str(uuid.uuid4())
+        self._put_raw(self._payload(body='rebound', tag=tag))
+        original_name = self._ready_names(self.data_folder_in)[0]
+        channel = self._channel(self.consumer_conn)
+
+        message = channel.basic_get(self.QUEUE)
+        channel.basic_reject(message.delivery_tag, requeue=True)
+
+        assert self._ready_names(self.data_folder_in) == [original_name]
+        assert channel._size(self.QUEUE) == 1
+        redelivered = channel.basic_get(self.QUEUE)
+        assert redelivered.delivery_tag == tag
+        assert bytes_to_str(redelivered.body) == 'rebound'
+        channel.basic_ack(redelivered.delivery_tag)
+        assert self._entries(self.data_folder_in) == []
+
+    def test_reject_without_requeue_discards_lease(self):
+        conn = self._connection(
+            self.data_folder_in, self.data_folder_out,
+            store_processed=True, processed_folder=self.processed_folder)
+        self._put_raw(self._payload())
+        channel = self._channel(conn)
+        message = channel.basic_get(self.QUEUE)
+
+        channel.basic_reject(message.delivery_tag, requeue=False)
+
+        assert self._entries(self.data_folder_in) == []
+        # discarded messages are not treated as processed
+        assert os.listdir(self.processed_folder) == []
+
+    def test_expired_lease_is_reclaimed_and_stale_owner_is_fenced(self):
+        tag = str(uuid.uuid4())
+        self._put_raw(self._payload(tag=tag))
+        stale_owner = self._channel(self.consumer_conn)
+        message = stale_owner.basic_get(self.QUEUE)
+        lease_name = self._lease_names(self.data_folder_in)[0]
+        # the owning process hangs past the lease deadline
+        self._expire_lease(self.data_folder_in, lease_name)
+
+        new_owner = self._channel(self.consumer_conn)  # startup sweep
+        redelivered = new_owner.basic_get(self.QUEUE)
+        assert redelivered is not None
+        assert redelivered.delivery_tag == tag
+        new_lease = self._lease_names(self.data_folder_in)[0]
+
+        # the stale owner finalising late must not remove the new lease
+        stale_owner.basic_ack(message.delivery_tag)
+        assert self._lease_names(self.data_folder_in) == [new_lease]
+        new_owner.basic_ack(redelivered.delivery_tag)
+        assert self._entries(self.data_folder_in) == []
+
+    def test_orphan_lease_from_dead_process_recovered_at_startup(self):
+        tag = str(uuid.uuid4())
+        ready_name = f'1700000000000_{tag}.{self.QUEUE}.msg'
+        lease_name = f'{ready_name}.lease.1.{uuid.uuid4().hex}'
+        with open(os.path.join(self.data_folder_in, lease_name), 'wb') as fh:
+            fh.write(str_to_bytes(dumps(self._payload(tag=tag))))
+
+        channel = self._channel(self.consumer_conn)  # sweeps at startup
+
+        assert self._ready_names(self.data_folder_in) == [ready_name]
+        message = channel.basic_get(self.QUEUE)
+        assert message is not None
+        assert message.delivery_tag == tag
+
+    def test_legacy_file_names_are_still_consumed(self):
+        tag = str(uuid.uuid4())
+        legacy_name = f'123456789_{uuid.uuid4()}.{self.QUEUE}.msg'
+        with open(os.path.join(self.data_folder_in, legacy_name), 'wb') as fh:
+            fh.write(str_to_bytes(dumps(self._payload(tag=tag))))
+
+        channel = self._channel(self.consumer_conn)
+        message = channel.basic_get(self.QUEUE)
+        assert message is not None
+        assert message.delivery_tag == tag
+        channel.basic_ack(message.delivery_tag)
+        assert self._entries(self.data_folder_in) == []
+
+    def test_corrupt_message_is_quarantined_and_queue_keeps_serving(self):
+        bad_name = f'000000000000_{uuid.uuid4()}.{self.QUEUE}.msg'
+        with open(os.path.join(self.data_folder_in, bad_name), 'wb') as fh:
+            fh.write(b'{"truncated": ')
+
+        good_tag = str(uuid.uuid4())
+        self._put_raw(self._payload(tag=good_tag))
+
+        channel = self._channel(self.consumer_conn)
+        message = channel._get(self.QUEUE)
+        assert message['properties']['delivery_tag'] == good_tag
+        assert self._ready_names(self.data_folder_in) == []
+        assert len(self._lease_names(self.data_folder_in)) == 1
+        quarantine = os.path.join(self.data_folder_in, QUARANTINE_DIR)
+        assert any(name.startswith(bad_name)
+                   for name in os.listdir(quarantine))
+
+    def test_purge_and_size_only_cover_published_messages(self):
+        self._put_raw(self._payload())
+        self._put_raw(self._payload())
+        channel = self._channel(self.consumer_conn)
+        channel.basic_get(self.QUEUE)  # one message leased, one still ready
+
+        assert channel._size(self.QUEUE) == 1
+        assert channel._purge(self.QUEUE) == 1
+        assert channel._size(self.QUEUE) == 0
+        assert len(self._lease_names(self.data_folder_in)) == 1
+
+    def test_unacked_message_restored_to_queue_on_clean_shutdown(self):
+        tag = str(uuid.uuid4())
+        self._put_raw(self._payload(tag=tag))
+        conn = self.consumer_conn
+        channel = self._channel(conn)
+        assert channel.basic_get(self.QUEUE) is not None
+        assert self._ready_names(self.data_folder_in) == []
+
+        channel.close()
+
+        assert len(self._ready_names(self.data_folder_in)) == 1
+        other = self._channel(self.consumer_conn)
+        redelivered = other.basic_get(self.QUEUE)
+        assert redelivered.delivery_tag == tag
+
+    def test_cross_device_processed_folder_rejected_upfront(self):
+        real_stat = os.stat
+        processed = os.path.abspath(self.processed_folder)
+
+        def fake_stat(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if os.path.abspath(str(path)) == processed:
+                # a genuine stat_result that only differs by device id, so
+                # is_dir()/mkdir() keep behaving normally
+                values = list(result)
+                values[2] = values[2] + 1
+                return os.stat_result(values)
+            return result
+
+        with patch.object(
+                filesystem_transport.os, 'stat', side_effect=fake_stat):
+            with pytest.raises(
+                    (ChannelError, OperationalError),
+                    match='different filesystem'):
+                conn = self._connection(
+                    self.data_folder_in, self.data_folder_out,
+                    store_processed=True,
+                    processed_folder=self.processed_folder,
+                    max_retries=0, interval_start=0,
+                    interval_step=0, interval_max=0)
+                conn.default_channel
+
+    def test_missing_data_folder_rejected_at_startup(self):
+        missing = tempfile.mkdtemp()
+        shutil.rmtree(missing)
+        with pytest.raises((ChannelError, OperationalError),
+                           match='does not exist'):
+            conn = self._connection(
+                missing, self.data_folder_out,
+                max_retries=0, interval_start=0,
+                interval_step=0, interval_max=0)
+            conn.default_channel
+
+
+def loads_bytes(raw):
+    return loads(bytes_to_str(raw))
 
 
 @t.skip.if_win32

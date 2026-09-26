@@ -1,0 +1,42 @@
+[
+  {
+    "id": 1,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 2,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 3,
+    "passed": false,
+    "reason": "basic_ack 先执行 self._leases.pop(delivery_tag)，随后才 unlink 或 replace；文件操作抛 OSError 时映射已删除。"
+  },
+  {
+    "id": 4,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 5,
+    "passed": false,
+    "reason": "现有用例分别覆盖过期租约回收与迟到确认；没有确认/回收并发 barrier 测试。本次套件在 pytest 缺失及 amqp 缺失处停止载入。"
+  },
+  {
+    "id": 6,
+    "passed": false,
+    "reason": "_validate_storage 比较 processed_folder 与 data_folder_in 的设备号；未检查 data_folder_in、data_folder_out 的跨设备组合。"
+  },
+  {
+    "id": 7,
+    "passed": true,
+    "reason": ""
+  },
+  {
+    "id": 8,
+    "passed": true,
+    "reason": ""
+  }
+]
